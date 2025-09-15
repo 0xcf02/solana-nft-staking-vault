@@ -1,4 +1,11 @@
 export type SolanaNftStakingVault = {
+  "address": "B8XmBimHbyZkzL1hsaYJM5BHwbPV2vVGf9eWtWc1zQ9P",
+  "metadata": {
+    "name": "solana_nft_staking_vault",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Solana NFT Staking Vault Program"
+  },
   "version": "0.1.0",
   "name": "solana_nft_staking_vault",
   "instructions": [
@@ -411,6 +418,13 @@ export type SolanaNftStakingVault = {
 };
 
 export const IDL: SolanaNftStakingVault = {
+  "address": "B8XmBimHbyZkzL1hsaYJM5BHwbPV2vVGf9eWtWc1zQ9P",
+  "metadata": {
+    "name": "solana_nft_staking_vault",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Solana NFT Staking Vault Program"
+  },
   "version": "0.1.0",
   "name": "solana_nft_staking_vault",
   "instructions": [

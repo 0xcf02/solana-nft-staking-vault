@@ -9,7 +9,7 @@ use anchor_spl::{
 };
 use spl_token::instruction::AuthorityType;
 
-declare_id!("DjVE6JNiYqPL2QXyCUUh8rNjHrbz9hXHNYt99MQ59qw1");
+declare_id!("B8XmBimHbyZkzL1hsaYJM5BHwbPV2vVGf9eWtWc1zQ9P");
 
 #[program]
 pub mod solana_nft_staking_vault {
@@ -31,8 +31,17 @@ pub mod solana_nft_staking_vault {
         vault.bump = ctx.bumps.vault;
         vault.paused = false;
         vault.last_update_timestamp = Clock::get()?.unix_timestamp;
+        
+        // Initialize RBAC & Governance
+        vault.upgrade_authority = ctx.accounts.authority.key();
+        vault.version = 1;
+        vault.upgrade_locked = false;
+        vault.pending_upgrade = None;
 
-        // Transfer mint authority to vault PDA
+        // Initialize Circuit Breaker & Security
+        vault.circuit_breaker = CircuitBreakerState::new();
+        vault.daily_limit = DailyLimits::new();
+
         let seeds = &[b"vault".as_ref(), &[vault.bump]];
         let signer = &[&seeds[..]];
 
@@ -51,6 +60,14 @@ pub mod solana_nft_staking_vault {
             Some(vault.key())
         )?;
 
+        // Verify that mint authority was transferred successfully
+        let mint_info = ctx.accounts.reward_token_mint.to_account_info();
+        let mint_account = Mint::try_deserialize(&mut &mint_info.data.borrow()[..])?;
+        require!(
+            mint_account.mint_authority == anchor_lang::prelude::COption::Some(vault.key()),
+            ErrorCode::MintAuthorityTransferFailed
+        );
+
         Ok(())
     }
 
@@ -59,10 +76,20 @@ pub mod solana_nft_staking_vault {
         let user_stake = &mut ctx.accounts.user_stake;
         let clock = Clock::get()?;
 
-        // Check if vault is not paused
         require!(!vault.paused, ErrorCode::VaultPaused);
 
-        // Verify NFT is valid (amount = 1, decimals = 0)
+        // Circuit breaker check
+        require!(
+            vault.circuit_breaker.can_execute(clock.unix_timestamp),
+            ErrorCode::CircuitBreakerActive
+        );
+
+        // Daily limits check
+        vault.daily_limit.reset_if_new_day(clock.unix_timestamp);
+        require!(
+            vault.daily_limit.can_stake(),
+            ErrorCode::DailyLimitExceeded
+        );
         require!(
             ctx.accounts.nft_mint.decimals == 0,
             ErrorCode::InvalidNft
@@ -72,7 +99,6 @@ pub mod solana_nft_staking_vault {
             ErrorCode::InvalidNft
         );
 
-        // Verify NFT belongs to authorized collection via metadata
         let metadata_account = &ctx.accounts.nft_metadata;
         require!(
             metadata_account.collection.is_some(),
@@ -89,15 +115,13 @@ pub mod solana_nft_staking_vault {
             ErrorCode::WrongCollection
         );
 
-        // Rate limiting: prevent multiple stakes in short time
         if user_stake.last_update_timestamp > 0 {
             require!(
-                clock.unix_timestamp - user_stake.last_update_timestamp >= 1, // 1 second minimum
+                clock.unix_timestamp - user_stake.last_update_timestamp >= 300, // 5 minutes
                 ErrorCode::TooFrequent
             );
         }
 
-        // Update rewards before changing stake
         if user_stake.staked_nfts > 0 {
             let time_elapsed = clock.unix_timestamp - user_stake.last_update_timestamp;
             let rewards_earned = calculate_rewards(
@@ -111,7 +135,6 @@ pub mod solana_nft_staking_vault {
                 .ok_or(ErrorCode::MathOverflow)?;
         }
 
-        // Transfer NFT to vault
         let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
@@ -122,17 +145,19 @@ pub mod solana_nft_staking_vault {
         );
         token::transfer(transfer_ctx, 1)?;
 
-        // Update user stake info
         user_stake.user = ctx.accounts.user.key();
         user_stake.staked_nfts = user_stake.staked_nfts
             .checked_add(1)
             .ok_or(ErrorCode::MathOverflow)?;
         user_stake.last_update_timestamp = clock.unix_timestamp;
 
-        // Update vault info
         vault.total_staked = vault.total_staked
             .checked_add(1)
             .ok_or(ErrorCode::MathOverflow)?;
+
+        // Record successful stake
+        vault.daily_limit.record_stake();
+        vault.circuit_breaker.on_success();
 
         emit!(NftStaked {
             user: ctx.accounts.user.key(),
@@ -148,17 +173,13 @@ pub mod solana_nft_staking_vault {
         let user_stake = &mut ctx.accounts.user_stake;
         let clock = Clock::get()?;
 
-        // Check if vault is not paused
         require!(!vault.paused, ErrorCode::VaultPaused);
         require!(user_stake.staked_nfts > 0, ErrorCode::NoNftsStaked);
-
-        // Rate limiting
         require!(
-            clock.unix_timestamp - user_stake.last_update_timestamp >= 1,
+            clock.unix_timestamp - user_stake.last_update_timestamp >= 300, // 5 minutes
             ErrorCode::TooFrequent
         );
 
-        // Calculate pending rewards
         let time_elapsed = clock.unix_timestamp - user_stake.last_update_timestamp;
         let rewards_earned = calculate_rewards(
             time_elapsed, 
@@ -170,7 +191,6 @@ pub mod solana_nft_staking_vault {
             .checked_add(rewards_earned)
             .ok_or(ErrorCode::MathOverflow)?;
 
-        // Transfer NFT back to user
         let seeds = &[b"vault".as_ref(), &[vault.bump]];
         let signer = &[&seeds[..]];
 
@@ -185,13 +205,11 @@ pub mod solana_nft_staking_vault {
         );
         token::transfer(transfer_ctx, 1)?;
 
-        // Update user stake info
         user_stake.staked_nfts = user_stake.staked_nfts
             .checked_sub(1)
             .ok_or(ErrorCode::MathUnderflow)?;
         user_stake.last_update_timestamp = clock.unix_timestamp;
 
-        // Update vault info
         vault.total_staked = vault.total_staked
             .checked_sub(1)
             .ok_or(ErrorCode::MathUnderflow)?;
@@ -210,16 +228,19 @@ pub mod solana_nft_staking_vault {
         let user_stake = &mut ctx.accounts.user_stake;
         let clock = Clock::get()?;
 
-        // Check if vault is not paused
         require!(!vault.paused, ErrorCode::VaultPaused);
 
-        // Rate limiting for claims (minimum 60 seconds between claims)
+        // Circuit breaker check
+        require!(
+            vault.circuit_breaker.can_execute(clock.unix_timestamp),
+            ErrorCode::CircuitBreakerActive
+        );
+
         require!(
             clock.unix_timestamp - user_stake.last_update_timestamp >= 60,
             ErrorCode::TooFrequentClaim
         );
 
-        // Calculate total pending rewards
         let time_elapsed = clock.unix_timestamp - user_stake.last_update_timestamp;
         let rewards_earned = calculate_rewards(
             time_elapsed, 
@@ -233,16 +254,42 @@ pub mod solana_nft_staking_vault {
 
         require!(total_rewards > 0, ErrorCode::NoRewardsToClaim);
 
-        // Check for reasonable reward amount (prevent overflow attacks)
-        let max_reward = vault.reward_rate_per_second
-            .checked_mul(86400) // Max 24 hours worth
+        // Daily limits check
+        vault.daily_limit.reset_if_new_day(clock.unix_timestamp);
+        require!(
+            vault.daily_limit.can_claim(total_rewards),
+            ErrorCode::DailyLimitExceeded
+        );
+
+        // Anti-exploitation: Maximum reward per day per NFT
+        let max_reward_per_nft_per_day = vault.reward_rate_per_second
+            .checked_mul(86400)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        let max_total_reward = max_reward_per_nft_per_day
+            .checked_mul(user_stake.staked_nfts as u64)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        require!(total_rewards <= max_total_reward, ErrorCode::ExcessiveRewardClaim);
+
+        // Additional safety: Check if reward amount seems reasonable
+        let time_since_init = clock.unix_timestamp - vault.last_update_timestamp;
+        let theoretical_max = vault.reward_rate_per_second
+            .checked_mul(time_since_init as u64)
             .ok_or(ErrorCode::MathOverflow)?
             .checked_mul(user_stake.staked_nfts as u64)
             .ok_or(ErrorCode::MathOverflow)?;
         
-        require!(total_rewards <= max_reward, ErrorCode::ExcessiveRewardClaim);
+        require!(total_rewards <= theoretical_max, ErrorCode::ExcessiveRewardClaim);
 
-        // Mint rewards to user
+        // Verify mint has sufficient authority
+        let mint_info = ctx.accounts.reward_token_mint.to_account_info();
+        let mint_account = Mint::try_deserialize(&mut &mint_info.data.borrow()[..])?;
+        require!(
+            mint_account.mint_authority == anchor_lang::prelude::COption::Some(vault.key()),
+            ErrorCode::InvalidMintAuthority
+        );
+
         let seeds = &[b"vault".as_ref(), &[vault.bump]];
         let signer = &[&seeds[..]];
 
@@ -257,9 +304,12 @@ pub mod solana_nft_staking_vault {
         );
         token::mint_to(mint_ctx, total_rewards)?;
 
-        // Reset user rewards
         user_stake.pending_rewards = 0;
         user_stake.last_update_timestamp = clock.unix_timestamp;
+
+        // Record successful claim
+        vault.daily_limit.record_claim(total_rewards);
+        vault.circuit_breaker.on_success();
 
         emit!(RewardsClaimed {
             user: ctx.accounts.user.key(),
@@ -270,10 +320,15 @@ pub mod solana_nft_staking_vault {
         Ok(())
     }
 
-    // Administrative functions
     pub fn pause_vault(ctx: Context<PauseVault>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
+        let pauser_role = &ctx.accounts.user_role;
+        
         require!(!vault.paused, ErrorCode::AlreadyPaused);
+        require!(
+            pauser_role.role.can_pause_vault(),
+            ErrorCode::InsufficientPermissions
+        );
         
         vault.paused = true;
         
@@ -287,7 +342,13 @@ pub mod solana_nft_staking_vault {
 
     pub fn unpause_vault(ctx: Context<PauseVault>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
+        let unpauser_role = &ctx.accounts.user_role;
+        
         require!(vault.paused, ErrorCode::NotPaused);
+        require!(
+            unpauser_role.role.can_pause_vault(),
+            ErrorCode::InsufficientPermissions
+        );
         
         vault.paused = false;
         
@@ -298,17 +359,207 @@ pub mod solana_nft_staking_vault {
         
         Ok(())
     }
+
+    // RBAC Functions
+    pub fn grant_role(
+        ctx: Context<ManageRole>, 
+        user: Pubkey,
+        role: Role
+    ) -> Result<()> {
+        let vault = &ctx.accounts.vault;
+        let granter_role_account = &ctx.accounts.granter_role;
+        
+        // Only SuperAdmin can grant roles
+        require!(
+            granter_role_account.role.can_manage_roles(),
+            ErrorCode::InsufficientPermissions
+        );
+
+        let role_account = &mut ctx.accounts.user_role;
+        role_account.user = user;
+        role_account.role = role;
+        role_account.granted_by = ctx.accounts.granter.key();
+        role_account.granted_at = Clock::get()?.unix_timestamp;
+
+        emit!(RoleGranted {
+            user,
+            role: role.clone(),
+            granted_by: ctx.accounts.granter.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    pub fn revoke_role(ctx: Context<ManageRole>) -> Result<()> {
+        let granter_role_account = &ctx.accounts.granter_role;
+        
+        require!(
+            granter_role_account.role.can_manage_roles(),
+            ErrorCode::InsufficientPermissions
+        );
+
+        let role_account = &mut ctx.accounts.user_role;
+        let user = role_account.user;
+
+        emit!(RoleRevoked {
+            user,
+            revoked_by: ctx.accounts.granter.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    // Upgrade Functions
+    pub fn propose_upgrade(
+        ctx: Context<ProposeUpgrade>,
+        new_version: u32,
+        timelock_seconds: i64,
+    ) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        let proposer_role = &ctx.accounts.proposer_role;
+
+        require!(!vault.upgrade_locked, ErrorCode::UpgradesLocked);
+        require!(vault.pending_upgrade.is_none(), ErrorCode::UpgradePending);
+        require!(
+            proposer_role.role.can_manage_upgrades(),
+            ErrorCode::InsufficientPermissions
+        );
+        require!(new_version > vault.version, ErrorCode::InvalidVersion);
+        require!(
+            timelock_seconds >= 3600, // Minimum 1 hour
+            ErrorCode::InvalidTimelock
+        );
+
+        let scheduled_timestamp = Clock::get()?.unix_timestamp + timelock_seconds;
+
+        vault.pending_upgrade = Some(PendingUpgrade {
+            new_version,
+            scheduled_timestamp,
+            proposer: ctx.accounts.proposer.key(),
+        });
+
+        emit!(UpgradeProposed {
+            new_version,
+            scheduled_timestamp,
+            proposer: ctx.accounts.proposer.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    pub fn execute_upgrade(ctx: Context<ExecuteUpgrade>) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        let executor_role = &ctx.accounts.executor_role;
+        
+        require!(
+            executor_role.role.can_manage_upgrades(),
+            ErrorCode::InsufficientPermissions
+        );
+
+        let pending_upgrade = vault.pending_upgrade.as_ref()
+            .ok_or(ErrorCode::NoUpgradePending)?;
+
+        let now = Clock::get()?.unix_timestamp;
+        require!(
+            now >= pending_upgrade.scheduled_timestamp,
+            ErrorCode::TimelockNotExpired
+        );
+
+        // Execute upgrade
+        vault.version = pending_upgrade.new_version;
+        vault.pending_upgrade = None;
+
+        emit!(UpgradeExecuted {
+            new_version: vault.version,
+            executor: ctx.accounts.executor.key(),
+            timestamp: now,
+        });
+
+        Ok(())
+    }
+
+    pub fn cancel_upgrade(ctx: Context<CancelUpgrade>) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        let canceller_role = &ctx.accounts.canceller_role;
+        
+        require!(
+            canceller_role.role.can_manage_upgrades(),
+            ErrorCode::InsufficientPermissions
+        );
+        require!(vault.pending_upgrade.is_some(), ErrorCode::NoUpgradePending);
+
+        vault.pending_upgrade = None;
+
+        emit!(UpgradeCancelled {
+            cancelled_by: ctx.accounts.canceller.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    pub fn lock_upgrades(ctx: Context<LockUpgrades>) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        let locker_role = &ctx.accounts.locker_role;
+        
+        require!(
+            locker_role.role.can_manage_upgrades(),
+            ErrorCode::InsufficientPermissions
+        );
+        require!(!vault.upgrade_locked, ErrorCode::UpgradesAlreadyLocked);
+
+        vault.upgrade_locked = true;
+        vault.pending_upgrade = None;
+
+        emit!(UpgradesLocked {
+            locked_by: ctx.accounts.locker.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
+
+    pub fn update_config(
+        ctx: Context<UpdateConfig>,
+        new_reward_rate: Option<u64>,
+        new_collection_mint: Option<Pubkey>,
+    ) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        let updater_role = &ctx.accounts.updater_role;
+        
+        require!(
+            updater_role.role.can_update_config(),
+            ErrorCode::InsufficientPermissions
+        );
+
+        if let Some(rate) = new_reward_rate {
+            require!(rate > 0, ErrorCode::InvalidRewardRate);
+            vault.reward_rate_per_second = rate;
+        }
+
+        if let Some(mint) = new_collection_mint {
+            vault.collection_mint = mint;
+        }
+
+        emit!(ConfigUpdated {
+            updated_by: ctx.accounts.updater.key(),
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        Ok(())
+    }
 }
 
-// Helper function for reward calculation with time validation
 fn calculate_rewards(
     time_elapsed: i64,
     reward_rate_per_second: u64,
     staked_nfts: u64,
 ) -> Result<u64> {
-    // Validate time_elapsed is reasonable (max 30 days)
     require!(
-        time_elapsed >= 0 && time_elapsed <= 2_592_000, // 30 days
+        time_elapsed >= 0 && time_elapsed <= 172_800, // 48 hours max
         ErrorCode::InvalidTimeElapsed
     );
 
@@ -362,7 +613,6 @@ pub struct StakeNft<'info> {
 
     pub nft_mint: Account<'info, Mint>,
 
-    /// NFT Metadata account for collection verification
     #[account(
         seeds = [
             b"metadata",
@@ -469,10 +719,115 @@ pub struct PauseVault<'info> {
     #[account(mut, seeds = [b"vault"], bump = vault.bump)]
     pub vault: Account<'info, VaultAccount>,
 
-    #[account(
-        constraint = authority.key() == vault.authority @ ErrorCode::Unauthorized
-    )]
+    #[account(mut)]
     pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [b"role", authority.key().as_ref()],
+        bump
+    )]
+    pub user_role: Account<'info, AccountRole>,
+}
+
+#[derive(Accounts)]
+pub struct ManageRole<'info> {
+    #[account(seeds = [b"vault"], bump = vault.bump)]
+    pub vault: Account<'info, VaultAccount>,
+
+    #[account(mut)]
+    pub granter: Signer<'info>,
+
+    #[account(
+        seeds = [b"role", granter.key().as_ref()],
+        bump
+    )]
+    pub granter_role: Account<'info, AccountRole>,
+
+    #[account(
+        init_if_needed,
+        payer = granter,
+        space = 8 + AccountRole::INIT_SPACE,
+        seeds = [b"role", user_role.user.as_ref()],
+        bump
+    )]
+    pub user_role: Account<'info, AccountRole>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ProposeUpgrade<'info> {
+    #[account(mut, seeds = [b"vault"], bump = vault.bump)]
+    pub vault: Account<'info, VaultAccount>,
+
+    #[account(mut)]
+    pub proposer: Signer<'info>,
+
+    #[account(
+        seeds = [b"role", proposer.key().as_ref()],
+        bump
+    )]
+    pub proposer_role: Account<'info, AccountRole>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteUpgrade<'info> {
+    #[account(mut, seeds = [b"vault"], bump = vault.bump)]
+    pub vault: Account<'info, VaultAccount>,
+
+    #[account(mut)]
+    pub executor: Signer<'info>,
+
+    #[account(
+        seeds = [b"role", executor.key().as_ref()],
+        bump
+    )]
+    pub executor_role: Account<'info, AccountRole>,
+}
+
+#[derive(Accounts)]
+pub struct CancelUpgrade<'info> {
+    #[account(mut, seeds = [b"vault"], bump = vault.bump)]
+    pub vault: Account<'info, VaultAccount>,
+
+    #[account(mut)]
+    pub canceller: Signer<'info>,
+
+    #[account(
+        seeds = [b"role", canceller.key().as_ref()],
+        bump
+    )]
+    pub canceller_role: Account<'info, AccountRole>,
+}
+
+#[derive(Accounts)]
+pub struct LockUpgrades<'info> {
+    #[account(mut, seeds = [b"vault"], bump = vault.bump)]
+    pub vault: Account<'info, VaultAccount>,
+
+    #[account(mut)]
+    pub locker: Signer<'info>,
+
+    #[account(
+        seeds = [b"role", locker.key().as_ref()],
+        bump
+    )]
+    pub locker_role: Account<'info, AccountRole>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateConfig<'info> {
+    #[account(mut, seeds = [b"vault"], bump = vault.bump)]
+    pub vault: Account<'info, VaultAccount>,
+
+    #[account(mut)]
+    pub updater: Signer<'info>,
+
+    #[account(
+        seeds = [b"role", updater.key().as_ref()],
+        bump
+    )]
+    pub updater_role: Account<'info, AccountRole>,
 }
 
 #[account]
@@ -486,6 +841,178 @@ pub struct VaultAccount {
     pub paused: bool,
     pub last_update_timestamp: i64,
     pub bump: u8,
+    // RBAC & Governance
+    pub upgrade_authority: Pubkey,
+    pub version: u32,
+    pub upgrade_locked: bool,
+    pub pending_upgrade: Option<PendingUpgrade>,
+    // Circuit Breaker & Security
+    pub circuit_breaker: CircuitBreakerState,
+    pub daily_limit: DailyLimits,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace)]
+pub struct CircuitBreakerState {
+    pub failure_count: u32,
+    pub last_failure_timestamp: i64,
+    pub blocked: bool,
+    pub total_transactions: u64,
+    pub failed_transactions: u64,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace)]
+pub struct DailyLimits {
+    pub max_stakes_per_day: u32,
+    pub max_claims_per_day: u32,
+    pub max_total_rewards_per_day: u64,
+    pub stakes_today: u32,
+    pub claims_today: u32,
+    pub rewards_claimed_today: u64,
+    pub last_reset_timestamp: i64,
+}
+
+impl CircuitBreakerState {
+    pub fn new() -> Self {
+        Self {
+            failure_count: 0,
+            last_failure_timestamp: 0,
+            blocked: false,
+            total_transactions: 0,
+            failed_transactions: 0,
+        }
+    }
+
+    pub fn can_execute(&self, current_timestamp: i64) -> bool {
+        const FAILURE_THRESHOLD: u32 = 10;
+        const RESET_TIMEOUT: i64 = 600; // 10 minutes
+
+        if !self.blocked {
+            return true;
+        }
+
+        // Reset if timeout has passed
+        if current_timestamp - self.last_failure_timestamp > RESET_TIMEOUT {
+            return true;
+        }
+
+        self.failure_count < FAILURE_THRESHOLD
+    }
+
+    pub fn on_success(&mut self) {
+        self.total_transactions += 1;
+        if self.blocked && self.failure_count > 0 {
+            self.failure_count = self.failure_count.saturating_sub(1);
+            if self.failure_count == 0 {
+                self.blocked = false;
+            }
+        }
+    }
+
+    pub fn on_failure(&mut self, current_timestamp: i64) {
+        const FAILURE_THRESHOLD: u32 = 10;
+        
+        self.total_transactions += 1;
+        self.failed_transactions += 1;
+        self.failure_count += 1;
+        self.last_failure_timestamp = current_timestamp;
+
+        if self.failure_count >= FAILURE_THRESHOLD {
+            self.blocked = true;
+        }
+    }
+}
+
+impl DailyLimits {
+    pub fn new() -> Self {
+        Self {
+            max_stakes_per_day: 100,
+            max_claims_per_day: 50,  
+            max_total_rewards_per_day: 1_000_000_000, // 1000 tokens with 6 decimals
+            stakes_today: 0,
+            claims_today: 0,
+            rewards_claimed_today: 0,
+            last_reset_timestamp: 0,
+        }
+    }
+
+    pub fn reset_if_new_day(&mut self, current_timestamp: i64) {
+        const SECONDS_PER_DAY: i64 = 86400;
+        
+        if current_timestamp - self.last_reset_timestamp > SECONDS_PER_DAY {
+            self.stakes_today = 0;
+            self.claims_today = 0;
+            self.rewards_claimed_today = 0;
+            self.last_reset_timestamp = current_timestamp;
+        }
+    }
+
+    pub fn can_stake(&self) -> bool {
+        self.stakes_today < self.max_stakes_per_day
+    }
+
+    pub fn can_claim(&self, reward_amount: u64) -> bool {
+        self.claims_today < self.max_claims_per_day &&
+        self.rewards_claimed_today + reward_amount <= self.max_total_rewards_per_day
+    }
+
+    pub fn record_stake(&mut self) {
+        self.stakes_today += 1;
+    }
+
+    pub fn record_claim(&mut self, reward_amount: u64) {
+        self.claims_today += 1;
+        self.rewards_claimed_today += reward_amount;
+    }
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, InitSpace)]
+pub struct PendingUpgrade {
+    pub new_version: u32,
+    pub scheduled_timestamp: i64,
+    pub proposer: Pubkey,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct AccountRole {
+    pub user: Pubkey,
+    pub role: Role,
+    pub granted_by: Pubkey,
+    pub granted_at: i64,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, InitSpace)]
+pub enum Role {
+    SuperAdmin,
+    Admin, 
+    Moderator,
+    Operator,
+}
+
+impl Role {
+    pub fn can_pause_vault(&self) -> bool {
+        matches!(self, Role::SuperAdmin | Role::Admin | Role::Moderator)
+    }
+
+    pub fn can_update_config(&self) -> bool {
+        matches!(self, Role::SuperAdmin | Role::Admin)
+    }
+
+    pub fn can_manage_roles(&self) -> bool {
+        matches!(self, Role::SuperAdmin)
+    }
+
+    pub fn can_moderate_users(&self) -> bool {
+        matches!(self, Role::SuperAdmin | Role::Admin | Role::Moderator)
+    }
+
+    pub fn can_manage_treasury(&self) -> bool {
+        matches!(self, Role::SuperAdmin | Role::Admin)
+    }
+
+    pub fn can_manage_upgrades(&self) -> bool {
+        matches!(self, Role::SuperAdmin | Role::Admin)
+    }
 }
 
 #[account]
@@ -531,6 +1058,54 @@ pub struct VaultUnpaused {
     pub timestamp: i64,
 }
 
+#[event]
+pub struct RoleGranted {
+    pub user: Pubkey,
+    pub role: Role,
+    pub granted_by: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct RoleRevoked {
+    pub user: Pubkey,
+    pub revoked_by: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct UpgradeProposed {
+    pub new_version: u32,
+    pub scheduled_timestamp: i64,
+    pub proposer: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct UpgradeExecuted {
+    pub new_version: u32,
+    pub executor: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct UpgradeCancelled {
+    pub cancelled_by: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct UpgradesLocked {
+    pub locked_by: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct ConfigUpdated {
+    pub updated_by: Pubkey,
+    pub timestamp: i64,
+}
+
 #[error_code]
 pub enum ErrorCode {
     #[msg("Math overflow")]
@@ -567,4 +1142,28 @@ pub enum ErrorCode {
     NotPaused,
     #[msg("Unauthorized access")]
     Unauthorized,
+    #[msg("Insufficient permissions for this action")]
+    InsufficientPermissions,
+    #[msg("Upgrades are permanently locked")]
+    UpgradesLocked,
+    #[msg("An upgrade is already pending")]
+    UpgradePending,
+    #[msg("No upgrade is currently pending")]
+    NoUpgradePending,
+    #[msg("Invalid version number")]
+    InvalidVersion,
+    #[msg("Invalid timelock duration")]
+    InvalidTimelock,
+    #[msg("Timelock period has not expired")]
+    TimelockNotExpired,
+    #[msg("Upgrades are already locked")]
+    UpgradesAlreadyLocked,
+    #[msg("Failed to transfer mint authority to vault")]
+    MintAuthorityTransferFailed,
+    #[msg("Invalid mint authority")]
+    InvalidMintAuthority,
+    #[msg("Circuit breaker is active - too many failures")]
+    CircuitBreakerActive,
+    #[msg("Daily operation limit exceeded")]
+    DailyLimitExceeded,
 }

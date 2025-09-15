@@ -12,19 +12,19 @@
   },
   "devDependencies": {
     "@coral-xyz/anchor": "^0.30.1",
-    "@solana/web3.js": "^1.95.2",
-    "@types/bn.js": "^5.1.5",
-    "@types/chai": "^4.3.0",
-    "@types/mocha": "^9.0.0",
-    "chai": "^4.3.4",
-    "mocha": "^9.0.3",
-    "prettier": "^2.6.2",
+    "@solana/web3.js": "^1.96.0",
+    "@types/bn.js": "^5.1.6",
+    "@types/chai": "^4.3.11",
+    "@types/mocha": "^10.0.6",
+    "chai": "^4.4.1",
+    "mocha": "^10.2.0",
+    "prettier": "^3.2.5",
     "ts-mocha": "^10.0.0",
-    "typescript": "^4.3.5"
+    "typescript": "^5.3.3"
   },
   "dependencies": {
-    "@metaplex-foundation/js": "^0.20.1",
-    "@metaplex-foundation/mpl-token-metadata": "^3.2.1",
+    "@metaplex-foundation/js": "^0.21.1",
+    "@metaplex-foundation/mpl-token-metadata": "^4.2.1",
     "@solana/spl-token": "^0.4.8"
   }
 }

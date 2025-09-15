@@ -2,14 +2,18 @@
 
 import { NFTMetadata } from '@/hooks/useNFTs'
 
+type ViewMode = 'grid' | 'list' | 'compact'
+
 interface NFTCardProps {
-  nft: NFTMetadata
+  nft: NFTMetadata & { isStaked?: boolean }
+  isStaked?: boolean
   onStake: () => void
-  loading: boolean
-  actionType: 'stake' | 'unstake'
+  onUnstake: () => void
+  disabled?: boolean
+  viewMode?: ViewMode
 }
 
-export function NFTCard({ nft, onStake, loading, actionType }: NFTCardProps) {
+export function NFTCard({ nft, isStaked = false, onStake, onUnstake, disabled = false, viewMode = 'grid' }: NFTCardProps) {
   return (
     <div className="bg-gray-900/50 border border-gray-600 rounded-xl p-4 hover:border-solana-purple/50 transition-colors">
       <div className="aspect-square bg-gray-700 rounded-lg mb-4 overflow-hidden">
@@ -48,22 +52,25 @@ export function NFTCard({ nft, onStake, loading, actionType }: NFTCardProps) {
           </p>
         )}
 
-        <button
-          onClick={onStake}
-          disabled={loading}
-          className={`w-full py-2 px-4 rounded-lg font-semibold transition-all duration-200 ${
-            actionType === 'stake'
-              ? 'bg-gradient-to-r from-solana-purple to-solana-green text-white hover:scale-105'
-              : 'bg-red-500 hover:bg-red-600 text-white hover:scale-105'
-          } disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100`}
-        >
-          {loading 
-            ? (actionType === 'stake' ? 'Staking...' : 'Unstaking...')
-            : (actionType === 'stake' ? 'Stake NFT' : 'Unstake NFT')
-          }
-        </button>
+        {isStaked ? (
+          <button
+            onClick={onUnstake}
+            disabled={disabled}
+            className="w-full py-2 px-4 rounded-lg font-semibold transition-all duration-200 bg-red-500 hover:bg-red-600 text-white hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100"
+          >
+            {disabled ? 'Unstaking...' : 'Unstake NFT'}
+          </button>
+        ) : (
+          <button
+            onClick={onStake}
+            disabled={disabled}
+            className="w-full py-2 px-4 rounded-lg font-semibold transition-all duration-200 bg-gradient-to-r from-solana-purple to-solana-green text-white hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100"
+          >
+            {disabled ? 'Staking...' : 'Stake NFT'}
+          </button>
+        )}
 
-        {actionType === 'unstake' && (
+        {isStaked && (
           <div className="text-xs text-center text-solana-green">
             ✨ Earning rewards
           </div>
